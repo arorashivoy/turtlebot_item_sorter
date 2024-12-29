@@ -51,7 +51,9 @@ setup(
             'item_sensor = assessment.item_sensor:main',
             'zone_sensor = assessment.zone_sensor:main',
             'robot_sensor = assessment.robot_sensor:main',
-            'controller = assessment.controller:main'
+            'controller0 = assessment.controller:controller0',
+            'controller1 = assessment.controller:controller1',
+            'controller2 = assessment.controller:controller2',
         ],
     },
 )

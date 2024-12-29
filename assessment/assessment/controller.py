@@ -1,4 +1,6 @@
 import sys
+import random
+import math
 
 import rclpy
 from rclpy.node import Node
@@ -6,22 +8,21 @@ from rclpy.qos import QoSPresetProfiles
 from rclpy.signals import SignalHandlerOptions
 from rclpy.executors import ExternalShutdownException, MultiThreadedExecutor
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
-import math
+
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Twist
-
 from sensor_msgs.msg import Image
 from sensor_msgs.msg import LaserScan
 from auro_interfaces.srv import ItemRequest
-from assessment_interfaces.msg import ItemHolder, ItemHolders, ItemLog, ItemList, Item, RobotList, Robot, Zone, ZoneList
+from assessment_interfaces.msg import ItemHolders, ItemLog, ItemList, RobotList, ZoneList
 
 
 class RobotController(Node):
 
-    def __init__(self):
+    def __init__(self, robot_name='robot1', zone_number=1, item_color='RED'):
         super().__init__('robot_controller')
 
-        self.declare_parameter('robot_name', 'robot1')
+        self.declare_parameter('robot_name', robot_name)
         self.robot_name = self.get_parameter(
             'robot_name').get_parameter_value().string_value
 
@@ -50,10 +51,11 @@ class RobotController(Node):
         self.item_to_collect = None
         self.holding_item = False
         self.target_zone = None
-        self.ZONE_NUMBER = 1
-        self.ITEM_COLOR = 'RED'
+        self.ZONE_NUMBER = zone_number
+        self.ITEM_COLOR = item_color
 
-        client_callback_group = MutuallyExclusiveCallbackGroup()
+        item_callback_group = MutuallyExclusiveCallbackGroup()
+        # offload_callback_group = MutuallyExclusiveCallbackGroup()
         timer_callback_group = MutuallyExclusiveCallbackGroup()
 
         self.timer_period = 0.1  # 100 milliseconds = 10 Hz
@@ -62,22 +64,24 @@ class RobotController(Node):
         # Velocity publisher
         self.cmd_vel_pub = self.create_publisher(Twist, f'{self.robot_name}/cmd_vel', 10)
 
+        # FIXME: Check if odom is needed
         # Odom subscriber
-        self.create_subscription(Odometry, f'{self.robot_name}/odom',
-                                 self.odom_callback, 10, callback_group=timer_callback_group)
+        # self.create_subscription(Odometry, f'{self.robot_name}/odom',
+        #                          self.odom_callback, 10, callback_group=timer_callback_group)
 
         # Item Manager
-        # FIXME: Check queue size
         self.create_subscription(ItemLog, '/item_log', self.item_log, 100, callback_group=timer_callback_group)
         self.create_subscription(ItemHolders, '/item_holders', self.item_holder,
                                  100, callback_group=timer_callback_group)
 
         # Item Manager Services
-        self.pick_up_item = self.create_client(ItemRequest, '/pick_up_item', callback_group=client_callback_group)
+        # self.pick_up_item = self.create_client(ItemRequest, '/pick_up_item', callback_group=timer_callback_group)
+        self.pick_up_item = self.create_client(ItemRequest, '/pick_up_item', callback_group=item_callback_group)
         while not self.pick_up_item.wait_for_service(timeout_sec=1.0):
             self.get_logger().info('pick up service not available, waiting again...')
 
-        self.offload_item = self.create_client(ItemRequest, '/offload_item', callback_group=client_callback_group)
+        # self.offload_item = self.create_client(ItemRequest, '/offload_item', callback_group=timer_callback_group)
+        self.offload_item = self.create_client(ItemRequest, '/offload_item', callback_group=item_callback_group)
         while not self.pick_up_item.wait_for_service(timeout_sec=1.0):
             self.get_logger().info('offload service not available, waiting again...')
 
@@ -105,76 +109,56 @@ class RobotController(Node):
         self.create_subscription(LaserScan, f'{self.robot_name}/scan', self.scan_callback,
                                  QoSPresetProfiles.SENSOR_DATA.value, callback_group=timer_callback_group)
 
-
     ##################################
     # Controller
     ##################################
-    def controller(self, item=False):
+    def controller(self, item=False, random_motion=False):
         twist = Twist()
+
+        if item:
+            twist = self.navigate_to_item()
+        else:
+            twist = self.navigate_to_zone()
 
         # Avoid obstacles dynamically
         if self.scan_triggered[self.SCAN_FRONT]:
             # self.get_logger().info("Obstacle detected in front! Turning right...")
             twist.linear.x = 0.0
             twist.angular.z = -0.5  # Turn right
-            return
         elif self.scan_triggered[self.SCAN_LEFT]:
             # self.get_logger().info("Obstacle detected on the left! Turning right...")
-            twist.linear.x = 0.0
+            twist.linear.x = 0.5
             twist.angular.z = -0.5  # Turn right
-            return
         elif self.scan_triggered[self.SCAN_RIGHT]:
             # self.get_logger().info("Obstacle detected on the right! Turning left...")
-            twist.linear.x = 0.0
+            twist.linear.x = 0.5
             twist.angular.z = 0.5  # Turn left
-            return
-
-        if item:
-            estimated_distance = 69.0 * float(self.item_to_collect.diameter) ** -0.89
-            twist.linear.x = 0.25 * estimated_distance
-            twist.angular.z = self.item_to_collect.x / 320.0
-
-            if estimated_distance <= 0.35:
-                twist.linear.x = 0.0
-                twist.angular.z = 0.0
-                self.cmd_vel_pub.publish(twist)
-                self.item_to_collect = None
-                self.holding_item = True
-                self.pick_up_item_action()
-                self.get_logger().info("Item picked up!")
-
-        else:
-            # TODO: Fix zone
-            estimated_distance = 69.0 * float(self.target_zone.size) ** -0.89
-            twist.linear.x = 0.00025 * estimated_distance
-            twist.linear.x = 0.30
-            twist.angular.z = self.target_zone.x / 320.0
-
-            self.get_logger().warn(f"Estimated distance: {estimated_distance}")
-
-            if estimated_distance <= 70:
-                twist.linear.x = 0.0
-                twist.angular.z = 0.0
-                self.cmd_vel_pub.publish(twist)
-                self.target_zone = None
-                self.offload_item_action()
-                self.get_logger().info("Item offloaded!")
 
         self.cmd_vel_pub.publish(twist)
+
+        if random_motion:
+            # Move around to reposition the robot
+            if self.reposition_timer < 20:  # Move for a short duration (~2 seconds at 10 Hz)
+                twist.linear.x = 0.15
+                twist.angular.z = random.choice([-0.3, 0.3])
+                self.cmd_vel_pub.publish(twist)
+                self.reposition_timer += 1
+            else:
+                self.moving_to_reposition = False
 
     def control_loop(self):
         if not self.holding_item:
             if self.item_to_collect:
-                self.navigate_to_item()
+                self.get_logger().info(f"Navigating to item: {self.item_to_collect}")
+                self.controller(item=True)
             else:
-                # TODO: Search for items
                 self.get_logger().info("Searching for items...")
                 self.search_for_items()
         else:
             if self.target_zone:
-                self.navigate_to_zone()
+                self.get_logger().info(f"Navigating to zone: {self.target_zone}")
+                self.controller(item=False)
             else:
-                # TODO: Search for Zone
                 self.get_logger().info("Searching for zones...")
                 self.search_for_zones()
 
@@ -182,36 +166,105 @@ class RobotController(Node):
     # Navigation
     ##################################
     def navigate_to_item(self):
-        if self.item_to_collect:
-            self.get_logger().info(f"Navigating to item: {self.item_to_collect}")
-            # TODO: Logic to navigate to item
-            self.controller(item=True)
-            # self.pick_up_item_action()
+        twist = Twist()
+
+        if not self.item_to_collect:
+            return twist
+
+        estimated_distance = 69.0 * float(self.item_to_collect.diameter) ** -0.89
+        twist.linear.x = 0.25 * estimated_distance
+        twist.angular.z = self.item_to_collect.x / 320.0
+
+        if estimated_distance <= 0.35:
+            twist.linear.x = 0.0
+            twist.angular.z = 0.0
+            self.cmd_vel_pub.publish(twist)
+            self.item_to_collect = None
+            self.holding_item = True
+            self.get_logger().info("Item picked up!")
+            self.pick_up_item_action()
+
+        return twist
 
     def navigate_to_zone(self):
-        if self.target_zone:
-            self.get_logger().info(f"Navigating to zone: {self.target_zone}")
-            # TODO: Move the robot to the target location
-            self.controller(item=False)
-            # self.offload_item_action()
+        twist = Twist()
+
+        if not self.target_zone:
+            return twist
+
+        twist.linear.x = 0.30
+        twist.angular.z = self.target_zone.x / 320.0
+
+        if self.target_zone.size >= 0.98:
+            twist.linear.x = 0.0
+            twist.angular.z = 0.0
+            self.cmd_vel_pub.publish(twist)
+            self.target_zone = None
+            self.holding_item = False
+            self.get_logger().info("Item offloaded!")
+            self.offload_item_action()
+
+        return twist
 
     ##################################
     # Searching
     ##################################
+    # def search_for_items(self):
+    #     """Logic to search for items."""
+    #     twist = Twist()
+    #     twist.linear.x = 0.0
+    #     twist.angular.z = 0.2
+    #     self.cmd_vel_pub.publish(twist)
+
     def search_for_items(self):
-        """Logic to search for items."""
+        """Logic to search for items. If a 360-degree search fails, move around to reposition."""
+        if not hasattr(self, 'item_search_rotation'):
+            self.item_search_rotation = 0.0
+            self.moving_to_reposition = False
+            self.reposition_timer = 0
+
         twist = Twist()
-        twist.linear.x = 0.0
-        twist.angular.z = 0.2  # Rotate to scan for items
-        self.cmd_vel_pub.publish(twist)
+        if not self.moving_to_reposition:
+            twist.linear.x = 0.0
+            twist.angular.z = 0.2
+            self.cmd_vel_pub.publish(twist)
+
+            self.item_search_rotation += abs(twist.angular.z) * self.timer_period
+
+            # If a full 360-degree rotation is completed
+            if self.item_search_rotation >= 2 * math.pi:
+                self.item_search_rotation = 0.0
+                self.moving_to_reposition = True
+                self.reposition_timer = 0
+                self.get_logger().info("Item not found after 360-degree search. Moving to reposition...")
+
+        else:
+            self.controller(random_motion=True)
 
     def search_for_zones(self):
-        """Logic to search for items."""
-        # TODO: make only one full circle then move to a random location
+        """Logic to search for zones. If a 360-degree search fails, move around to reposition."""
+        if not hasattr(self, 'zone_search_rotation'):
+            self.zone_search_rotation = 0.0
+            self.moving_to_reposition = False
+            self.reposition_timer = 0
+
         twist = Twist()
-        twist.linear.x = 0.0
-        twist.angular.z = 0.2  # Rotate to scan for items
-        self.cmd_vel_pub.publish(twist)
+        if not self.moving_to_reposition:
+            twist.linear.x = 0.0
+            twist.angular.z = 0.2
+            self.cmd_vel_pub.publish(twist)
+
+            self.zone_search_rotation += abs(twist.angular.z) * self.timer_period
+
+            # If a full 360-degree rotation is completed
+            if self.zone_search_rotation >= 2 * math.pi:
+                self.zone_search_rotation = 0.0
+                self.moving_to_reposition = True
+                self.reposition_timer = 0
+                self.get_logger().info("Zone not found after 360-degree search. Moving to reposition...")
+
+        else:
+            self.controller(random_motion=True)
 
     ##################################
     # Item Manager Services
@@ -227,22 +280,28 @@ class RobotController(Node):
         if response.success:
             self.get_logger().info("Item successfully picked up!")
             self.holding_item = True
+            self.item_to_collect = None
+            self.search_for_zones()
         else:
-            self.get_logger().error("Failed to pick up the item.")
+            self.get_logger().error(f"Failed to pick up the item. {response}")
+            self.search_for_items()
 
     def offload_item_action(self):
         request = ItemRequest.Request()
         request.robot_id = self.robot_name
 
         future = self.offload_item.call_async(request)
-        rclpy.spin_until_future_complete(self, future)
+        self.executor.spin_until_future_complete(future)
         response = future.result()
 
         if response.success:
             self.get_logger().info("Item successfully offloaded!")
             self.holding_item = False
+            self.target_zone = None
+            self.search_for_items()
         else:
-            self.get_logger().error("Failed to offload the item.")
+            self.get_logger().error(f"Failed to offload the item. {response}")
+            # self.search_for_zones()
 
     ##################################
     # Item Manager
@@ -257,13 +316,15 @@ class RobotController(Node):
     # Item Sensor
     ##################################
     def items(self, msg):
+        if self.holding_item:
+            return
+
         # Process visible items
         for item in msg.data:
             # TODO: If holding then goto another of same color
             if item.colour == self.ITEM_COLOR:
                 self.item_to_collect = item
-                self.get_logger().info(f"Item detected: {item}")
-                # raise RuntimeError
+                # self.get_logger().info(f"Item detected: {item}")
                 break
 
     def image_items(self, msg):
@@ -282,16 +343,12 @@ class RobotController(Node):
     # Zone Sensor
     ##################################
     def zone(self, msg):
-        if not self.holding_item:
-            return
-
         # Process visible zones
         for zone in msg.data:
-            # TODO: Set target zone
             if self.holding_item:
                 if zone.zone == self.ZONE_NUMBER:
                     self.target_zone = zone
-                    self.get_logger().info(f"Target zone: {zone}")
+                    # self.get_logger().info(f"Target zone: {zone}")
                     break
 
     def image_zone(self, msg):
@@ -329,11 +386,14 @@ class RobotController(Node):
         super().destroy_node()
 
 
-def main(args=None):
+###############################################################################
+# Main
+###############################################################################
+def main(robot_name='robot1', zone_number=1, item_color='RED', args=None):
 
     rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
 
-    node = RobotController()
+    node = RobotController(robot_name, zone_number, item_color)
     executor = MultiThreadedExecutor()
     executor.add_node(node)
 
@@ -346,6 +406,18 @@ def main(args=None):
     finally:
         node.destroy_node()
         rclpy.try_shutdown()
+
+###############################################################################
+# Controller Entry Points
+###############################################################################
+def controller0(args=None):
+    main('robot1', 1, 'RED', args)
+
+def controller1(args=None):
+    main('robot2', 2, 'GREEN', args)
+
+def controller2(args=None):
+    main('robot3', 3, 'BLUE', args)
 
 
 if __name__ == '__main__':
