@@ -40,13 +40,14 @@ class RobotController(Node):
         self.y = self.initial_y
         self.yaw = self.initial_yaw
 
+        self.other_robots_data = []
         self.other_robots_positions = {}
         self.lock = Lock()
 
-        self.COLLISION_THRESHOLD = 5e-8
+        self.COLLISION_THRESHOLD = 10
 
         self.scan_triggered = [False] * 4
-        self.SCAN_THRESHOLD = 0.5
+        self.SCAN_THRESHOLD = 0.6
         self.SCAN_FRONT = 0
         self.SCAN_LEFT = 1
         self.SCAN_BACK = 2
@@ -121,65 +122,81 @@ class RobotController(Node):
     ###########################################################################
     # Controller
     ###########################################################################
-    # def avoid_collision_with_robots(self, twist):
+    # def avoid_collision_with_robots(self):
+    #     twist = Twist()
+    #     for robot in self.other_robots_data:
+    #         if robot.size > 0.10:
+    #             twist.linear.x = -0.3
+    #             twist.angular.z = -1 * robot.x / 320.0
+    #
+    #             self.cmd_vel_pub.publish(twist)
+    #             return True
+    #     return False
+
+    def avoid_collision_with_robots(self):
+        twist = Twist()
+        for robot in self.other_robots_data:
+            distance = math.sqrt(robot.x**2 + robot.y**2)
+            self.get_logger().warn(f"Robot: {robot}\nDistance: {distance}")
+
+            # if distance < self.COLLISION_THRESHOLD:
+            if abs(robot.x) < self.COLLISION_THRESHOLD and abs(robot.y) < self.COLLISION_THRESHOLD:
+                twist.linear.x = -0.3
+                twist.angular.z = -1 * robot.x / 320.0
+
+                self.cmd_vel_pub.publish(twist)
+                return True
+        return False
+
+    # def avoid_collision_with_robots(self):
+    #     twist = Twist()
     #     with self.lock:
+    #         # Initialize repulsion vector
+    #         repulsion_x = 0.0
+    #         repulsion_y = 0.0
+    #
     #         for robot_name, (other_x, other_y) in self.other_robots_positions.items():
     #             distance = math.sqrt((self.x - other_x)**2 + (self.y - other_y)**2)
     #
+    #             self.get_logger().warn(f"Distance to {robot_name}: {distance}")
     #             if distance < self.COLLISION_THRESHOLD:
-    #                 self.get_logger().warn(f"Potential collision with {robot_name}! Stopping...")
-    #                 twist.linear.x = 0.0
-    #                 twist.angular.z = 0.5
+    #                 self.get_logger().warn(f"Potential collision with {robot_name}! Moving away...")
     #
-    #     return twist
-    def avoid_collision_with_robots(self, twist):
-        with self.lock:
-            # Initialize repulsion vector
-            repulsion_x = 0.0
-            repulsion_y = 0.0
-
-            for robot_name, (other_x, other_y) in self.other_robots_positions.items():
-                distance = math.sqrt((self.x - other_x)**2 + (self.y - other_y)**2)
-
-                if distance < self.COLLISION_THRESHOLD:
-                    self.get_logger().warn(f"Potential collision with {robot_name}! Moving away...distance: {distance}")
-
-                    # Compute direction vector away from the other robot
-                    delta_x = self.x - other_x
-                    delta_y = self.y - other_y
-
-                    # Normalize and add to the repulsion vector
-                    if distance > 0:  # Avoid division by zero
-                        repulsion_x += delta_x / distance
-                        repulsion_y += delta_y / distance
-
-            # If repulsion vector is non-zero, apply it to the twist
-            if repulsion_x != 0.0 or repulsion_y != 0.0:
-                # Compute the angle to move away
-                repulsion_angle = math.atan2(repulsion_y, repulsion_x)
-
-                # Update the twist to move away
-                twist.linear.x = -0.1  # Move backward slowly
-                twist.angular.z = 0.5 * np.sign(repulsion_angle)  # Rotate away from the repulsion direction
-
-            self.get_logger().warn(f"Repulsion vector: ({repulsion_x}, {repulsion_y})")
-
-        return twist
+    #                 # Compute direction vector away from the other robot
+    #                 delta_x = self.x - other_x
+    #                 delta_y = self.y - other_y
+    #
+    #                 # Normalize and add to the repulsion vector
+    #                 if distance > 0:  # Avoid division by zero
+    #                     repulsion_x += delta_x / distance
+    #                     repulsion_y += delta_y / distance
+    #
+    #         # If repulsion vector is non-zero, apply it to the twist
+    #         if repulsion_x != 0.0 or repulsion_y != 0.0:
+    #             # Compute the angle to move away
+    #             repulsion_angle = math.atan2(repulsion_y, repulsion_x)
+    #
+    #             # Update the twist to move away
+    #             twist.linear.x = -1.1  # Move backward slowly
+    #             twist.angular.z = 0.5 * np.sign(repulsion_angle)  # Rotate away from the repulsion direction
+    #
+    #             self.get_logger().warn(f"Repulsion vector: ({repulsion_x}, {repulsion_y})")
+    #             return True
+    #
+    #     return False
 
     def controller(self, item=False, random_motion=False):
         twist = Twist()
 
         if item:
-            twist = self.navigate_to_item()
+            twist = self.navigate_to_item(twist)
         else:
-            twist = self.navigate_to_zone()
-
-        twist = self.avoid_collision_with_robots(twist)
+            twist = self.navigate_to_zone(twist)
 
         # Avoid obstacles dynamically
         if self.scan_triggered[self.SCAN_FRONT]:
             twist.linear.x = 0.0
-            twist.angular.z = 0.5 * np.sign(twist.angular.z) if twist.angular.z != 0.0 and not item else 0.5
+            twist.angular.z = 0.5
         elif self.scan_triggered[self.SCAN_LEFT]:
             twist.linear.x = 0.5
             twist.angular.z = -0.5
@@ -187,19 +204,56 @@ class RobotController(Node):
             twist.linear.x = 0.5
             twist.angular.z = 0.5
 
-        self.cmd_vel_pub.publish(twist)
+        if not self.avoid_collision_with_robots():
+            self.cmd_vel_pub.publish(twist)
 
-        if random_motion:
-            # Move around to reposition the robot
-            if self.reposition_timer < 20:
-                twist.linear.x = 0.15
-                twist.angular.z = random.choice([-0.3, 0.3])
+            if random_motion:
+                # Move around to reposition the robot
+                if self.reposition_timer < 20:
+                    twist.linear.x = 0.15
+                    twist.angular.z = random.choice([-0.3, 0.3])
+                    self.cmd_vel_pub.publish(twist)
+                    self.reposition_timer += 1
+                else:
+                    self.moving_to_reposition = False
+
+    # NOTE: The below function is for debugging purposes only
+    def rotate_and_move_forward(self, sign):
+        if not hasattr(self, 'rotate_and_move_forward_angle'):
+            self.rotate_and_move_forward_angle = 0.0
+            self.rotate_and_move_forward_moving = False
+
+        twist = Twist()
+        if not self.rotate_and_move_forward_moving:
+            twist.linear.x = 0.0
+            twist.angular.z = 0.4 if sign else -0.4
+            self.cmd_vel_pub.publish(twist)
+
+            self.rotate_and_move_forward_angle += abs(twist.angular.z) * self.timer_period
+
+            # If a full 360-degree rotation is completed
+            if self.rotate_and_move_forward_angle >= math.pi:
+                self.rotate_and_move_forward_angle = 0.0
+                self.rotate_and_move_forward_moving = True
+                self.get_logger().info("Moving forward...")
+
+        else:
+            twist.linear.x = 0.30
+            twist.angular.z = 0.0
+            if not self.avoid_collision_with_robots():
                 self.cmd_vel_pub.publish(twist)
-                self.reposition_timer += 1
-            else:
-                self.moving_to_reposition = False
 
     def control_loop(self):
+        # NOTE: For debug purposes
+        # if self.robot_name == "robot2":
+        #     self.rotate_and_move_forward(False)
+        #     return
+        # elif self.robot_name == "robot3":
+        #     self.rotate_and_move_forward(True)
+        #     return
+        # else:
+        #     return
+
         if not self.holding_item:
             if self.item_to_collect:
                 self.get_logger().info(f"Navigating to item: {self.item_to_collect}")
@@ -218,14 +272,13 @@ class RobotController(Node):
     ###########################################################################
     # Navigation
     ###########################################################################
-    def navigate_to_item(self):
-        twist = Twist()
-
+    def navigate_to_item(self, twist):
         if not self.item_to_collect:
             return twist
 
         estimated_distance = 69.0 * float(self.item_to_collect.diameter) ** -0.89
-        twist.linear.x = 0.25 * estimated_distance
+        # twist.linear.x = 0.25 * estimated_distance
+        twist.linear.x = 0.30
         twist.angular.z = self.item_to_collect.x / 320.0
 
         if estimated_distance <= 0.35:
@@ -239,9 +292,7 @@ class RobotController(Node):
 
         return twist
 
-    def navigate_to_zone(self):
-        twist = Twist()
-
+    def navigate_to_zone(self, twist):
         if not self.target_zone:
             return twist
 
@@ -271,7 +322,7 @@ class RobotController(Node):
         twist = Twist()
         if not self.moving_to_reposition:
             twist.linear.x = 0.0
-            twist.angular.z = 0.2
+            twist.angular.z = 0.4
             self.cmd_vel_pub.publish(twist)
 
             self.item_search_rotation += abs(twist.angular.z) * self.timer_period
@@ -295,7 +346,7 @@ class RobotController(Node):
         twist = Twist()
         if not self.moving_to_reposition:
             twist.linear.x = 0.0
-            twist.angular.z = 0.2
+            twist.angular.z = 0.4
             self.cmd_vel_pub.publish(twist)
 
             self.zone_search_rotation += abs(twist.angular.z) * self.timer_period
@@ -378,7 +429,7 @@ class RobotController(Node):
     # Robot Sensor
     ###########################################################################
     def robots(self, msg):
-        pass
+        self.other_robots_data = msg.data
 
     def image_robots(self, msg):
         pass
