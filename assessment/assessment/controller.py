@@ -299,7 +299,7 @@ class RobotController(Node):
         twist.linear.x = 0.30
         twist.angular.z = self.target_zone.x / 320.0
 
-        if self.target_zone.size >= 0.99:
+        if self.target_zone.size >= 0.995:
             twist.linear.x = 0.1
             twist.angular.z = 0.0
             self.cmd_vel_pub.publish(twist)
