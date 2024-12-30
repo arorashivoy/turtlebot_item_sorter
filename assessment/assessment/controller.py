@@ -1,6 +1,8 @@
 import sys
 import random
 import math
+import numpy as np
+from threading import Lock
 
 import rclpy
 from rclpy.node import Node
@@ -30,16 +32,18 @@ class RobotController(Node):
         self.declare_parameter('y', 0.0)
         self.declare_parameter('yaw', 0.0)
 
-        self.initial_x = self.get_parameter(
-            'x').get_parameter_value().double_value
-        self.initial_y = self.get_parameter(
-            'y').get_parameter_value().double_value
-        self.initial_yaw = self.get_parameter(
-            'yaw').get_parameter_value().double_value
+        self.initial_x = self.get_parameter('x').get_parameter_value().double_value
+        self.initial_y = self.get_parameter('y').get_parameter_value().double_value
+        self.initial_yaw = self.get_parameter('yaw').get_parameter_value().double_value
 
         self.x = self.initial_x
         self.y = self.initial_y
         self.yaw = self.initial_yaw
+
+        self.other_robots_positions = {}
+        self.lock = Lock()
+
+        self.COLLISION_THRESHOLD = 5e-8
 
         self.scan_triggered = [False] * 4
         self.SCAN_THRESHOLD = 0.5
@@ -55,7 +59,6 @@ class RobotController(Node):
         self.ITEM_COLOR = item_color
 
         item_callback_group = MutuallyExclusiveCallbackGroup()
-        # offload_callback_group = MutuallyExclusiveCallbackGroup()
         timer_callback_group = MutuallyExclusiveCallbackGroup()
 
         self.timer_period = 0.1  # 100 milliseconds = 10 Hz
@@ -64,10 +67,16 @@ class RobotController(Node):
         # Velocity publisher
         self.cmd_vel_pub = self.create_publisher(Twist, f'{self.robot_name}/cmd_vel', 10)
 
-        # FIXME: Check if odom is needed
         # Odom subscriber
-        # self.create_subscription(Odometry, f'{self.robot_name}/odom',
-        #                          self.odom_callback, 10, callback_group=timer_callback_group)
+        self.create_subscription(Odometry, f'/{self.robot_name}/odom',
+                                 self.odom_callback, 10, callback_group=timer_callback_group)
+
+        # Odom subscribers for other robots
+        other_robot_names = [f'robot{i}' for i in range(1, 4) if f'robot{i}' != self.robot_name]
+
+        for other_robot_name in other_robot_names:
+            self.create_subscription(Odometry, f'/{other_robot_name}/odom', lambda msg: self.other_robot_odom_callback(
+                msg=msg, robot_name=other_robot_name), 10, callback_group=timer_callback_group)
 
         # Item Manager
         self.create_subscription(ItemLog, '/item_log', self.item_log, 100, callback_group=timer_callback_group)
@@ -109,9 +118,54 @@ class RobotController(Node):
         self.create_subscription(LaserScan, f'{self.robot_name}/scan', self.scan_callback,
                                  QoSPresetProfiles.SENSOR_DATA.value, callback_group=timer_callback_group)
 
-    ##################################
+    ###########################################################################
     # Controller
-    ##################################
+    ###########################################################################
+    # def avoid_collision_with_robots(self, twist):
+    #     with self.lock:
+    #         for robot_name, (other_x, other_y) in self.other_robots_positions.items():
+    #             distance = math.sqrt((self.x - other_x)**2 + (self.y - other_y)**2)
+    #
+    #             if distance < self.COLLISION_THRESHOLD:
+    #                 self.get_logger().warn(f"Potential collision with {robot_name}! Stopping...")
+    #                 twist.linear.x = 0.0
+    #                 twist.angular.z = 0.5
+    #
+    #     return twist
+    def avoid_collision_with_robots(self, twist):
+        with self.lock:
+            # Initialize repulsion vector
+            repulsion_x = 0.0
+            repulsion_y = 0.0
+
+            for robot_name, (other_x, other_y) in self.other_robots_positions.items():
+                distance = math.sqrt((self.x - other_x)**2 + (self.y - other_y)**2)
+
+                if distance < self.COLLISION_THRESHOLD:
+                    self.get_logger().warn(f"Potential collision with {robot_name}! Moving away...distance: {distance}")
+
+                    # Compute direction vector away from the other robot
+                    delta_x = self.x - other_x
+                    delta_y = self.y - other_y
+
+                    # Normalize and add to the repulsion vector
+                    if distance > 0:  # Avoid division by zero
+                        repulsion_x += delta_x / distance
+                        repulsion_y += delta_y / distance
+
+            # If repulsion vector is non-zero, apply it to the twist
+            if repulsion_x != 0.0 or repulsion_y != 0.0:
+                # Compute the angle to move away
+                repulsion_angle = math.atan2(repulsion_y, repulsion_x)
+
+                # Update the twist to move away
+                twist.linear.x = -0.1  # Move backward slowly
+                twist.angular.z = 0.5 * np.sign(repulsion_angle)  # Rotate away from the repulsion direction
+
+            self.get_logger().warn(f"Repulsion vector: ({repulsion_x}, {repulsion_y})")
+
+        return twist
+
     def controller(self, item=False, random_motion=False):
         twist = Twist()
 
@@ -120,25 +174,24 @@ class RobotController(Node):
         else:
             twist = self.navigate_to_zone()
 
+        twist = self.avoid_collision_with_robots(twist)
+
         # Avoid obstacles dynamically
         if self.scan_triggered[self.SCAN_FRONT]:
-            # self.get_logger().info("Obstacle detected in front! Turning right...")
             twist.linear.x = 0.0
-            twist.angular.z = -0.5  # Turn right
+            twist.angular.z = 0.5 * np.sign(twist.angular.z) if twist.angular.z != 0.0 and not item else 0.5
         elif self.scan_triggered[self.SCAN_LEFT]:
-            # self.get_logger().info("Obstacle detected on the left! Turning right...")
             twist.linear.x = 0.5
-            twist.angular.z = -0.5  # Turn right
+            twist.angular.z = -0.5
         elif self.scan_triggered[self.SCAN_RIGHT]:
-            # self.get_logger().info("Obstacle detected on the right! Turning left...")
             twist.linear.x = 0.5
-            twist.angular.z = 0.5  # Turn left
+            twist.angular.z = 0.5
 
         self.cmd_vel_pub.publish(twist)
 
         if random_motion:
             # Move around to reposition the robot
-            if self.reposition_timer < 20:  # Move for a short duration (~2 seconds at 10 Hz)
+            if self.reposition_timer < 20:
                 twist.linear.x = 0.15
                 twist.angular.z = random.choice([-0.3, 0.3])
                 self.cmd_vel_pub.publish(twist)
@@ -162,9 +215,9 @@ class RobotController(Node):
                 self.get_logger().info("Searching for zones...")
                 self.search_for_zones()
 
-    ##################################
+    ###########################################################################
     # Navigation
-    ##################################
+    ###########################################################################
     def navigate_to_item(self):
         twist = Twist()
 
@@ -176,7 +229,7 @@ class RobotController(Node):
         twist.angular.z = self.item_to_collect.x / 320.0
 
         if estimated_distance <= 0.35:
-            twist.linear.x = 0.0
+            twist.linear.x = 0.1
             twist.angular.z = 0.0
             self.cmd_vel_pub.publish(twist)
             self.item_to_collect = None
@@ -195,8 +248,8 @@ class RobotController(Node):
         twist.linear.x = 0.30
         twist.angular.z = self.target_zone.x / 320.0
 
-        if self.target_zone.size >= 0.98:
-            twist.linear.x = 0.0
+        if self.target_zone.size >= 0.99:
+            twist.linear.x = 0.1
             twist.angular.z = 0.0
             self.cmd_vel_pub.publish(twist)
             self.target_zone = None
@@ -206,18 +259,10 @@ class RobotController(Node):
 
         return twist
 
-    ##################################
+    ###########################################################################
     # Searching
-    ##################################
-    # def search_for_items(self):
-    #     """Logic to search for items."""
-    #     twist = Twist()
-    #     twist.linear.x = 0.0
-    #     twist.angular.z = 0.2
-    #     self.cmd_vel_pub.publish(twist)
-
+    ###########################################################################
     def search_for_items(self):
-        """Logic to search for items. If a 360-degree search fails, move around to reposition."""
         if not hasattr(self, 'item_search_rotation'):
             self.item_search_rotation = 0.0
             self.moving_to_reposition = False
@@ -242,7 +287,6 @@ class RobotController(Node):
             self.controller(random_motion=True)
 
     def search_for_zones(self):
-        """Logic to search for zones. If a 360-degree search fails, move around to reposition."""
         if not hasattr(self, 'zone_search_rotation'):
             self.zone_search_rotation = 0.0
             self.moving_to_reposition = False
@@ -266,9 +310,9 @@ class RobotController(Node):
         else:
             self.controller(random_motion=True)
 
-    ##################################
+    ###########################################################################
     # Item Manager Services
-    ##################################
+    ###########################################################################
     def pick_up_item_action(self):
         request = ItemRequest.Request()
         request.robot_id = self.robot_name
@@ -303,18 +347,18 @@ class RobotController(Node):
             self.get_logger().error(f"Failed to offload the item. {response}")
             # self.search_for_zones()
 
-    ##################################
+    ###########################################################################
     # Item Manager
-    ##################################
+    ###########################################################################
     def item_log(self, msg):
         pass
 
     def item_holder(self, msg):
         pass
 
-    ##################################
+    ###########################################################################
     # Item Sensor
-    ##################################
+    ###########################################################################
     def items(self, msg):
         if self.holding_item:
             return
@@ -330,18 +374,18 @@ class RobotController(Node):
     def image_items(self, msg):
         pass
 
-    ##################################
+    ###########################################################################
     # Robot Sensor
-    ##################################
+    ###########################################################################
     def robots(self, msg):
         pass
 
     def image_robots(self, msg):
         pass
 
-    ##################################
+    ###########################################################################
     # Zone Sensor
-    ##################################
+    ###########################################################################
     def zone(self, msg):
         # Process visible zones
         for zone in msg.data:
@@ -354,9 +398,9 @@ class RobotController(Node):
     def image_zone(self, msg):
         pass
 
-    ##################################
+    ###########################################################################
     # Laser Scanner
-    ##################################
+    ###########################################################################
     def scan_callback(self, msg):
         # Group scan ranges into 4 segments
         # Front, left, and right segments are each 60 degrees
@@ -371,8 +415,10 @@ class RobotController(Node):
         self.scan_triggered[self.SCAN_BACK] = min(back_ranges) < self.SCAN_THRESHOLD
         self.scan_triggered[self.SCAN_RIGHT] = min(right_ranges) < self.SCAN_THRESHOLD
 
+    ###########################################################################
+    # Odometry
+    ###########################################################################
     def odom_callback(self, msg):
-        """Callback to update robot pose from /odom."""
         pose = msg.pose.pose
         self.x = pose.position.x
         self.y = pose.position.y
@@ -381,6 +427,14 @@ class RobotController(Node):
         siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
         cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
         self.yaw = math.atan2(siny_cosp, cosy_cosp)
+
+    def other_robot_odom_callback(self, msg, robot_name):
+        pose = msg.pose.pose
+        other_robot_x = pose.position.x
+        other_robot_y = pose.position.y
+
+        with self.lock:
+            self.other_robots_positions[robot_name] = (other_robot_x, other_robot_y)
 
     def destroy_node(self):
         super().destroy_node()
