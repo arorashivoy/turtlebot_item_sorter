@@ -2,6 +2,7 @@ import sys
 import random
 import math
 from threading import Lock
+from enum import Enum
 
 import rclpy
 from rclpy.node import Node
@@ -16,6 +17,121 @@ from sensor_msgs.msg import Image
 from sensor_msgs.msg import LaserScan
 from auro_interfaces.srv import ItemRequest
 from assessment_interfaces.msg import ItemHolders, ItemLog, ItemList, RobotList, ZoneList
+
+import smash
+import smach_ros
+
+###############################################################################
+# States
+###############################################################################
+class State(Enum):
+    IDLE = 0
+    SEARCHING_ITEM = 1
+    NAVIGATING_TO_ITEM = 2
+    PICKING_UP_ITEM = 3
+    SEARCHING_ZONE = 4
+    NAVIGATING_TO_ZONE = 5
+    OFFLOADING_ITEM = 6
+
+
+###############################################################################
+# SMACH State Implementations
+###############################################################################
+class IdleState(smach.State):
+    def __init__(self, robot_controller):
+        super().__init__(outcomes=['search_item', 'search_zone'])
+        self.robot_controller = robot_controller
+
+    def execute(self, userdata):
+        self.robot_controller.get_logger().info("State: IDLE")
+        if not self.robot_controller.holding_item:
+            return 'search_item'
+        else:
+            return 'search_zone'
+
+
+class SearchingItemState(smach.State):
+    def __init__(self, robot_controller):
+        super().__init__(outcomes=['item_found', 'continue_search'])
+        self.robot_controller = robot_controller
+
+    def execute(self, userdata):
+        self.robot_controller.get_logger().info("State: SEARCHING_ITEM")
+        if self.robot_controller.item_to_collect:
+            return 'item_found'
+        else:
+            self.robot_controller.search_for_items()
+            return 'continue_search'
+
+
+class NavigatingToItemState(smach.State):
+    def __init__(self, robot_controller):
+        super().__init__(outcomes=['searching', 'navigating'])
+        self.robot_controller = robot_controller
+
+    def execute(self, userdata):
+        self.robot_controller.get_logger().info("State: NAVIGATING_TO_ITEM")
+        if self.robot_controller.item_to_collect:
+            self.robot_controller.controller(item=True)
+            return 'navigating'
+        else:
+            return 'searching'
+
+
+class PickingUpItemState(smach.State):
+    def __init__(self, robot_controller):
+        super().__init__(outcomes=['picked_up', 'failed'])
+        self.robot_controller = robot_controller
+
+    def execute(self, userdata):
+        self.robot_controller.get_logger().info("State: PICKING_UP_ITEM")
+        self.robot_controller.pick_up_item_action()
+        if self.robot_controller.holding_item:
+            return 'picked_up'
+        else:
+            return 'failed'
+
+
+class SearchingZoneState(smach.State):
+    def __init__(self, robot_controller):
+        super().__init__(outcomes=['zone_found', 'continue_search'])
+        self.robot_controller = robot_controller
+
+    def execute(self, userdata):
+        self.robot_controller.get_logger().info("State: SEARCHING_ZONE")
+        if self.robot_controller.target_zone:
+            return 'zone_found'
+        else:
+            self.robot_controller.search_for_zones()
+            return 'continue_search'
+
+
+class NavigatingToZoneState(smach.State):
+    def __init__(self, robot_controller):
+        super().__init__(outcomes=['searching', 'navigating'])
+        self.robot_controller = robot_controller
+
+    def execute(self, userdata):
+        self.robot_controller.get_logger().info("State: NAVIGATING_TO_ZONE")
+        if self.robot_controller.target_zone:
+            self.robot_controller.controller(item=False)
+            return 'navigating'
+        else:
+            return 'searching'
+
+
+class OffloadingItemState(smach.State):
+    def __init__(self, robot_controller):
+        super().__init__(outcomes=['offloaded', 'failed'])
+        self.robot_controller = robot_controller
+
+    def execute(self, userdata):
+        self.robot_controller.get_logger().info("State: OFFLOADING_ITEM")
+        self.robot_controller.offload_item_action()
+        if not self.robot_controller.holding_item:
+            return 'offloaded'
+        else:
+            return 'failed'
 
 
 ###############################################################################
@@ -61,15 +177,49 @@ class RobotController(Node):
         self.ZONE_NUMBER = zone_number
         self.ITEM_COLOR = item_color
 
+        self.init_communication()
+
+        # Initialize state management
+        self.current_state = State.IDLE
+
+        self.sm = smach.StateMachine(outcomes=['completed', 'aborted'])
+        with self.sm:
+            smach.StateMachine.add('IDLE', IdleState(self),
+                                   transitions={'search_item': 'SEARCHING_ITEM',
+                                                'search_zone': 'SEARCHING_ZONE'})
+
+            smach.StateMachine.add('SEARCHING_ITEM', SearchingItemState(self),
+                                   transitions={'item_found': 'NAVIGATING_TO_ITEM',
+                                                'continue_search': 'SEARCHING_ITEM'})
+
+            smach.StateMachine.add('NAVIGATING_TO_ITEM', NavigatingToItemState(self),
+                                   transitions={'navigating': 'NAVIGATING_TO_ITEM',
+                                                'searching': 'SEARCHING_ITEM'})
+
+            smach.StateMachine.add('PICKING_UP_ITEM', PickingUpItemState(self),
+                                   transitions={'picked_up': 'SEARCHING_ZONE',
+                                                'failed': 'SEARCHING_ITEM'})
+
+            smach.StateMachine.add('SEARCHING_ZONE', SearchingZoneState(self),
+                                   transitions={'zone_found': 'NAVIGATING_TO_ZONE',
+                                                'continue_search': 'SEARCHING_ZONE'})
+
+            smach.StateMachine.add('NAVIGATING_TO_ZONE', NavigatingToZoneState(self),
+                                   transitions={'navigating': 'NAVIGATING_TO_ZONE',
+                                                'searching': 'SEARCHING_ZONE'})
+
+            smach.StateMachine.add('OFFLOADING_ITEM', OffloadingItemState(self),
+                                   transitions={'offloaded': 'SEARCHING_ITEM',
+                                                'failed': 'SEARCHING_ZONE'})
+
+    ###########################################################################
+    # Services, Publishers, and Subscribers
+    ###########################################################################
+    def init_communication(self):
+        # Initialize callback groups
         item_callback_group = MutuallyExclusiveCallbackGroup()
         timer_callback_group = MutuallyExclusiveCallbackGroup()
 
-        self.timer_period = 0.1  # 100 milliseconds = 10 Hz
-        self.timer = self.create_timer(self.timer_period, self.control_loop, callback_group=timer_callback_group)
-
-        #######################################################################
-        # Services, Publishers, and Subscribers
-        #######################################################################
         # Velocity publisher
         self.cmd_vel_pub = self.create_publisher(Twist, f'{self.robot_name}/cmd_vel', 10)
 
@@ -123,6 +273,20 @@ class RobotController(Node):
         # LaserScanner subscriber
         self.create_subscription(LaserScan, f'{self.robot_name}/scan', self.scan_callback,
                                  QoSPresetProfiles.SENSOR_DATA.value, callback_group=timer_callback_group)
+
+        # self.timer_period = 0.1  # 100 milliseconds = 10 Hz
+        # self.timer = self.create_timer(self.timer_period, self.control_loop, callback_group=timer_callback_group)
+
+    ###########################################################################
+    # Run SMACH State Machine
+    ###########################################################################
+    def run(self):
+        outcome = self.sm.execute()
+
+        if outcome == 'completed':
+            self.get_logger().info("State machine completed successfully!")
+        elif outcome == 'aborted':
+            self.get_logger().error("State machine aborted!")
 
     ###########################################################################
     # Controller
@@ -259,20 +423,52 @@ class RobotController(Node):
         # else:
         #     return
 
-        if not self.holding_item:
+        # if not self.holding_item:
+        #     if self.item_to_collect:
+        #         self.get_logger().info(f"Navigating to item: {self.item_to_collect}")
+        #         self.controller(item=True)
+        #     else:
+        #         self.get_logger().info("Searching for items...")
+        #         self.search_for_items()
+        # else:
+        #     if self.target_zone:
+        #         self.get_logger().info(f"Navigating to zone: {self.target_zone}")
+        #         self.controller(item=False)
+        #     else:
+        #         self.get_logger().info("Searching for zones...")
+        #         self.search_for_zones()
+
+        if self.current_state == State.IDLE:
+            if not self.holding_item:
+                self.current_state = State.SEARCHING_ITEM
+            else:
+                self.current_state = State.SEARCHING_ZONE
+        elif self.current_state == State.SEARCHING_ITEM:
             if self.item_to_collect:
-                self.get_logger().info(f"Navigating to item: {self.item_to_collect}")
+                self.current_state = State.NAVIGATING_TO_ITEM
+            else:
+                self.search_for_items()
+        elif self.current_state == State.NAVIGATING_TO_ITEM:
+            if self.item_to_collect:
                 self.controller(item=True)
             else:
-                self.get_logger().info("Searching for items...")
-                self.search_for_items()
-        else:
+                self.current_state = State.SEARCHING_ITEM
+        elif self.current_state == State.PICKING_UP_ITEM:
+            self.pick_up_item_action()
+            self.current_state = State.SEARCHING_ZONE
+        elif self.current_state == State.SEARCHING_ZONE:
             if self.target_zone:
-                self.get_logger().info(f"Navigating to zone: {self.target_zone}")
+                self.current_state = State.NAVIGATING_TO_ZONE
+            else:
+                self.search_for_zones()
+        elif self.current_state == State.NAVIGATING_TO_ZONE:
+            if self.target_zone:
                 self.controller(item=False)
             else:
-                self.get_logger().info("Searching for zones...")
-                self.search_for_zones()
+                self.current_state = State.SEARCHING_ZONE
+        elif self.current_state == State.OFFLOADING_ITEM:
+            self.offload_item_action()
+            self.current_state = State.SEARCHING_ITEM
 
     ###########################################################################
     # Navigation
@@ -293,7 +489,8 @@ class RobotController(Node):
             self.item_to_collect = None
             self.holding_item = True
             self.get_logger().info("Item picked up!")
-            self.pick_up_item_action()
+            # self.pick_up_item_action()
+            self.current_state = State.PICKING_UP_ITEM
 
         return twist
 
@@ -311,7 +508,8 @@ class RobotController(Node):
             self.target_zone = None
             self.holding_item = False
             self.get_logger().info("Item offloaded!")
-            self.offload_item_action()
+            # self.offload_item_action()
+            self.current_state = State.OFFLOADING_ITEM
 
         return twist
 
@@ -504,18 +702,26 @@ def main(robot_name='robot1', zone_number=1, item_color='RED', args=None):
     rclpy.init(args=args, signal_handler_options=SignalHandlerOptions.NO)
 
     node = RobotController(robot_name, zone_number, item_color)
-    executor = MultiThreadedExecutor()
-    executor.add_node(node)
 
     try:
-        executor.spin()
+        node.run()
     except KeyboardInterrupt:
         pass
-    except ExternalShutdownException:
-        sys.exit(1)
     finally:
         node.destroy_node()
-        rclpy.try_shutdown()
+        rclpy.shutdown()
+
+    # executor = MultiThreadedExecutor()
+    # executor.add_node(node)
+    # try:
+    #     executor.spin()
+    # except KeyboardInterrupt:
+    #     pass
+    # except ExternalShutdownException:
+    #     sys.exit(1)
+    # finally:
+    #     node.destroy_node()
+    #     rclpy.try_shutdown()
 
 ###############################################################################
 # Controller Entry Points
